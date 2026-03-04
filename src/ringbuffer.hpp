@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -43,10 +44,11 @@ template <typename T> class RingBuffer {
 
         return count;
     }
+    uint64_t dropped() const { return dropped_.load(std::memory_order_relaxed); }
 
   private:
     mutable std::mutex mu_;
     std::queue<T> q_;
     size_t cap_;
-    uint64_t dropped_;
+    std::atomic<uint64_t> dropped_{0};
 };

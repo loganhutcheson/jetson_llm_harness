@@ -87,7 +87,8 @@ class ImuProducer {
             const uint64_t count = produced_.load(std::memory_order_relaxed);
             const double dt_s = (now - last_t) / 1e9;
             const double hz = dt_s > 0.0 ? (double)(count - last_count) / dt_s : 0.0;
-            std::cout << "[imu] hz=" << hz << " total=" << count << "\n";
+            const uint64_t dropped = out_.dropped();
+            std::cout << "[imu] hz=" << hz << " total=" << count << " dropped=" << dropped << "\n";
             last_t = now;
             last_count = count;
         }
