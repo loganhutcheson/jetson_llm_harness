@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <variant>
 #include <vector>
 
 inline uint64_t now_ns();

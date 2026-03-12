@@ -1,6 +1,7 @@
 #pragma once
 #include "latest.hpp"
 #include "messages.hpp"
+#include "mpu6050.hpp"
 #include "ringbuffer.hpp"
 #include "time.hpp"
 
@@ -46,8 +47,11 @@ class CameraProducer {
 
 class ImuProducer {
   public:
-    ImuProducer(RingBuffer<ImuSample> &out, int hz = 200)
-        : out_(out), period_(std::chrono::microseconds(1'000'000 / hz)) {}
+    ImuProducer(RingBuffer<ImuSample> &out, int hz = 200,
+                ImuRuntimeConfig cfg = load_imu_runtime_config())
+        : out_(out), period_(std::chrono::microseconds(1'000'000 / hz)), config_(std::move(cfg)) {
+        reader_ = make_imu_reader(config_, &startup_status_);
+    }
 
     void start() {
         produced_.store(0, std::memory_order_relaxed);
@@ -63,17 +67,27 @@ class ImuProducer {
             mth_.join();
     }
 
+    const std::string &startup_status() const { return startup_status_; }
+
   private:
     void run() {
         while (running_.load(std::memory_order_acquire)) {
-            ImuSample s;
-            s.seq = seq_++;
-            s.t_capture_ns = now_ns();
-            // dummy values; later you’ll read real IMU
-            // TODO: read from IMU sensor
-            s.az = 9.81f;
-            out_.push(std::move(s));
-            produced_.fetch_add(1, std::memory_order_relaxed);
+            try {
+                ImuSample sample = reader_->read(seq_++);
+                last_sample_seq_.store(sample.seq, std::memory_order_relaxed);
+                last_ax_.store(sample.ax, std::memory_order_relaxed);
+                last_ay_.store(sample.ay, std::memory_order_relaxed);
+                last_az_.store(sample.az, std::memory_order_relaxed);
+                last_gx_.store(sample.gx, std::memory_order_relaxed);
+                last_gy_.store(sample.gy, std::memory_order_relaxed);
+                last_gz_.store(sample.gz, std::memory_order_relaxed);
+                out_.push(std::move(sample));
+                produced_.fetch_add(1, std::memory_order_relaxed);
+            } catch (const std::exception &ex) {
+                std::cout << "[imu] read failure: " << ex.what() << "\n";
+                running_.store(false, std::memory_order_release);
+                break;
+            }
             std::this_thread::sleep_for(period_);
         }
     }
@@ -89,7 +103,14 @@ class ImuProducer {
             const double dt_s = (now - last_t) / 1e9;
             const double hz = dt_s > 0.0 ? (double)(count - last_count) / dt_s : 0.0;
             const uint64_t dropped = out_.dropped();
-            std::cout << "[imu] hz=" << hz << " total=" << count << " dropped=" << dropped << "\n";
+            std::cout << "[imu] hz=" << hz << " total=" << count << " dropped=" << dropped
+                      << " sample.seq=" << last_sample_seq_.load(std::memory_order_relaxed)
+                      << " accel=(" << last_ax_.load(std::memory_order_relaxed) << ","
+                      << last_ay_.load(std::memory_order_relaxed) << ","
+                      << last_az_.load(std::memory_order_relaxed) << ")"
+                      << " gyro=(" << last_gx_.load(std::memory_order_relaxed) << ","
+                      << last_gy_.load(std::memory_order_relaxed) << ","
+                      << last_gz_.load(std::memory_order_relaxed) << ")\n";
             last_t = now;
             last_count = count;
         }
@@ -97,9 +118,19 @@ class ImuProducer {
 
     RingBuffer<ImuSample> &out_;
     std::chrono::microseconds period_;
+    ImuRuntimeConfig config_;
+    std::unique_ptr<IImuReader> reader_;
+    std::string startup_status_;
     std::atomic<bool> running_{false};
     std::thread th_;
     uint64_t seq_{0};
     std::atomic<uint64_t> produced_{0};
+    std::atomic<uint64_t> last_sample_seq_{0};
+    std::atomic<float> last_ax_{0.0f};
+    std::atomic<float> last_ay_{0.0f};
+    std::atomic<float> last_az_{0.0f};
+    std::atomic<float> last_gx_{0.0f};
+    std::atomic<float> last_gy_{0.0f};
+    std::atomic<float> last_gz_{0.0f};
     std::thread mth_;
 };

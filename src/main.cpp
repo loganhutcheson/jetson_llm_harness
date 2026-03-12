@@ -56,6 +56,8 @@ int main() {
 
     SystemState state;
 
+    std::cout << "[main] " << imu.startup_status() << "\n";
+
     cam.start();
     imu.start();
 
