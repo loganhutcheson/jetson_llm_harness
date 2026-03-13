@@ -13,9 +13,9 @@
 #include <thread>
 #include <vector>
 
-static void dispatch_action(const OutputAction &action, ConsoleLcdConsumer &lcd,
-                            ConsoleSpeakerConsumer &speaker, ConsoleLogConsumer &logger,
-                            LlmActionConsumer &llm_consumer) {
+static void dispatch_action(const OutputAction &action, OledLcdConsumer &lcd,
+                            ConsoleSpeakerConsumer &speaker, GpioBuzzerConsumer &buzzer,
+                            ConsoleLogConsumer &logger, LlmActionConsumer &llm_consumer) {
     std::visit(
         [&](const auto &a) {
             using T = std::decay_t<decltype(a)>;
@@ -24,6 +24,7 @@ static void dispatch_action(const OutputAction &action, ConsoleLcdConsumer &lcd,
                 lcd.consume(a);
             } else if constexpr (std::is_same_v<T, PlayTone>) {
                 speaker.consume(a);
+                buzzer.consume(a);
             } else if constexpr (std::is_same_v<T, LogLine>) {
                 logger.consume(a);
             } else if constexpr (std::is_same_v<T, LlmPrompt>) {
@@ -50,13 +51,17 @@ int main() {
     StubLlmClient llm;
     LlmActionConsumer llm_consumer(llm);
 
-    ConsoleLcdConsumer lcd;
+    OledLcdConsumer lcd;
     ConsoleSpeakerConsumer speaker;
+    GpioBuzzerConsumer buzzer;
     ConsoleLogConsumer logger;
 
     SystemState state;
 
     std::cout << "[main] " << imu.startup_status() << "\n";
+    std::cout << "[main] oled enabled=" << (lcd.enabled() ? 1 : 0) << "\n";
+    std::cout << "[main] buzzer enabled=" << (buzzer.enabled() ? 1 : 0)
+              << " pin=" << buzzer.pin() << "\n";
 
     cam.start();
     imu.start();
@@ -71,7 +76,7 @@ int main() {
         if (auto cam_opt = cam_latest.peek()) {
             auto cam_actions = handle_event(state, CameraObserved{*cam_opt});
             for (const auto &action : cam_actions) {
-                dispatch_action(action, lcd, speaker, logger, llm_consumer);
+                dispatch_action(action, lcd, speaker, buzzer, logger, llm_consumer);
             }
         }
 
@@ -82,14 +87,14 @@ int main() {
         if (imu_cnt > 0) {
             auto imu_actions = handle_event(state, ImuBatchReady{t0, std::move(imu_samples)});
             for (const auto &action : imu_actions) {
-                dispatch_action(action, lcd, speaker, logger, llm_consumer);
+                dispatch_action(action, lcd, speaker, buzzer, logger, llm_consumer);
             }
         }
 
         // Planner tick drives high-level status updates
         auto tick_actions = handle_event(state, PlannerTick{t0});
         for (const auto &action : tick_actions) {
-            dispatch_action(action, lcd, speaker, logger, llm_consumer);
+            dispatch_action(action, lcd, speaker, buzzer, logger, llm_consumer);
         }
 
         csv << t0 << "," << state.tick_count << "," << to_string(state.mode) << ","
@@ -99,6 +104,7 @@ int main() {
         std::cout << "[MAIN] tick=" << i << " mode=" << to_string(state.mode)
                   << " cam_seq=" << state.last_cam_seq << " imu_seq=" << state.last_imu_seq
                   << " imu_cnt=" << imu_cnt << " accel_mag=" << state.last_accel_mag
+                  << " motion_delta=" << state.last_motion_delta
                   << " alert=" << state.last_motion_alert << "\n";
 
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -106,6 +112,24 @@ int main() {
 
     cam.stop();
     imu.stop();
+
+    lcd.consume(DisplayText{
+        "RUN COMPLETE",
+        "cam=" + std::to_string(state.last_cam_seq) + " imu=" + std::to_string(state.last_imu_seq),
+    });
+    logger.consume(LogLine{
+        "run complete: mode=" + std::string(to_string(state.mode)) +
+            " accel_mag=" + std::to_string(state.last_accel_mag) +
+            " motion_delta=" + std::to_string(state.last_motion_delta),
+    });
+    speaker.consume(PlayTone{
+        880,
+        1000,
+    });
+    buzzer.consume(PlayTone{
+        880,
+        1000,
+    });
 
     std::cout << "wrote results_mac.csv\n";
     return 0;

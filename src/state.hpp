@@ -1,6 +1,7 @@
 #pragma once
 #include "messages.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -26,6 +27,7 @@ struct SystemState {
     double last_imu_age_ms{-1.0};
 
     double last_accel_mag{0.0};
+    double last_motion_delta{0.0};
     bool last_motion_alert{false};
 };
 
@@ -42,26 +44,42 @@ inline const char *to_string(Mode m) {
     }
 }
 
-inline bool detect_motion_alert(const std::vector<ImuSample> &samples, double *out_mag = nullptr) {
+inline bool detect_motion_alert(const std::vector<ImuSample> &samples, double *out_mag = nullptr,
+                                double *out_max_delta = nullptr) {
     if (samples.empty()) {
         if (out_mag) {
             *out_mag = 0.0;
         }
+        if (out_max_delta) {
+            *out_max_delta = 0.0;
+        }
         return false;
     }
 
-    const auto &s = samples.back();
-    const double mag =
-        std::sqrt(static_cast<double>(s.ax) * s.ax + static_cast<double>(s.ay) * s.ay +
-                  static_cast<double>(s.az) * s.az);
+    double max_delta = 0.0;
+    double prev_mag = 0.0;
+    for (size_t i = 0; i < samples.size(); ++i) {
+        const auto &sample = samples[i];
+        const double mag = std::sqrt(static_cast<double>(sample.ax) * sample.ax +
+                                     static_cast<double>(sample.ay) * sample.ay +
+                                     static_cast<double>(sample.az) * sample.az);
+        if (i > 0) {
+            max_delta = std::max(max_delta, std::fabs(mag - prev_mag));
+        }
+        prev_mag = mag;
+    }
+
+    const double mag = prev_mag;
 
     if (out_mag) {
         *out_mag = mag;
     }
+    if (out_max_delta) {
+        *out_max_delta = max_delta;
+    }
 
-    // Simple threshold for exploratory simulation.
-    // With your current dummy IMU producer (az = 9.81), this should stay calm.
-    return std::fabs(mag - 9.81) > 1.5;
+    // Trigger on either a large deviation from gravity or a sharp in-batch acceleration change.
+    return std::fabs(mag - 9.81) > 1.5 || max_delta > 0.75;
 }
 
 inline std::vector<OutputAction> handle_event(SystemState &st, const InputEvent &ev) {
@@ -117,23 +135,25 @@ inline std::vector<OutputAction> handle_event(SystemState &st, const InputEvent 
                 }
 
                 double mag = 0.0;
-                const bool alert = detect_motion_alert(e.samples, &mag);
+                double max_delta = 0.0;
+                const bool alert = detect_motion_alert(e.samples, &mag, &max_delta);
                 st.last_accel_mag = mag;
+                st.last_motion_delta = max_delta;
                 st.last_motion_alert = alert;
 
                 if (alert) {
                     st.mode = Mode::Alert;
                     actions.push_back(LogLine{
-                        "imu alert: accel magnitude deviated from gravity, mag=" +
-                            std::to_string(mag),
+                        "imu alert: accel_mag=" + std::to_string(mag) +
+                            " max_delta=" + std::to_string(max_delta),
                     });
                     actions.push_back(DisplayText{
                         "IMU ALERT",
-                        "mag=" + std::to_string(mag),
+                        "d=" + std::to_string(max_delta),
                     });
                     actions.push_back(PlayTone{
                         1200,
-                        180,
+                        max_delta > 1.5 ? 180 : 90,
                     });
                     actions.push_back(LlmPrompt{
                         "The IMU detected a sudden motion event. "
