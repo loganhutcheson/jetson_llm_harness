@@ -54,3 +54,22 @@ JETSON_BUZZER_ENABLE=1
 JETSON_BUZZER_PIN=7
 JETSON_BUZZER_ACTIVE_LOW=1
 ./build/jetson_runtime
+
+----- CAM1 IMX219 Bring-Up -----
+This repo does not yet use the camera in-process, but the Jetson-specific CAM1
+bring-up steps are tracked here:
+
+- `jetson/camera/README.txt`
+- `jetson/camera/force_imx219_cam1_dtb.sh`
+
+Why it matters:
+- On this Jetson, the active runtime DTB came from the `A_kernel-dtb` /
+  `B_kernel-dtb` partitions rather than only from `/boot/extlinux/extlinux.conf`
+  and `/boot/dtb/...`.
+- That meant a camera overlay could look correct on disk while the live runtime
+  still had no `cam_i2cmux`, no `imx219`, and no `/dev/video0`.
+
+Validated result after applying the partition DTB fix:
+- `imx219 9-0010` binds on CAM1
+- `/dev/video0` appears
+- Argus still capture succeeds to JPEG
