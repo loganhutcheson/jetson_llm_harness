@@ -73,3 +73,20 @@ Validated result after applying the partition DTB fix:
 - `imx219 9-0010` binds on CAM1
 - `/dev/video0` appears
 - Argus still capture succeeds to JPEG
+
+----- Jetson Camera Inference -----
+The first working live inference path on the Jetson is documented here:
+
+- `jetson/inference/README.txt`
+- `jetson/inference/mobilenetv2_camera_demo.py`
+
+Current status:
+- CSI camera capture works through Argus / GStreamer
+- OpenCV DNN can run a live `MobileNetV2` ONNX model on the Jetson camera feed
+- annotated output can be saved to video for review
+
+Important note:
+- `jetson-inference` native binaries can be rebuilt on this JetPack 6 machine,
+  but its stock Caffe sample models are not a reliable default path with
+  TensorRT 10
+- the working demo here uses a more modern ONNX path instead
