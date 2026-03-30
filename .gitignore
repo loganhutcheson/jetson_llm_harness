@@ -1,5 +1,2 @@
-/build
-/build-local
-/build-runtime
-__pycache__/
-/results_mac.csv
+build/
+experiments/observer/app

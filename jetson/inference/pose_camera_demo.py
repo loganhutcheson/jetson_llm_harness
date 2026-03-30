@@ -9,7 +9,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+# Default pose model path for the OpenCV DNN backend. Passing a `.pt` model
+# switches the script to the Ultralytics runtime instead.
 MODEL_PATH = "/home/logan/models/yolo11n-pose.onnx"
+# COCO-style 17-keypoint layout used by the YOLO pose models this script expects.
 KEYPOINT_NAMES = [
     "nose",
     "left_eye",
@@ -29,6 +32,7 @@ KEYPOINT_NAMES = [
     "left_ankle",
     "right_ankle",
 ]
+# Skeleton edges used only for the visualization overlay.
 SKELETON = [
     (5, 6),
     (5, 7),
@@ -46,6 +50,8 @@ SKELETON = [
 
 
 def ensure_model(path: str, backend: str) -> None:
+    # Fail early with backend-specific guidance so the user knows which model
+    # artifact is expected before camera startup begins.
     model_dir = os.path.dirname(path)
     if model_dir:
         os.makedirs(model_dir, exist_ok=True)
@@ -69,6 +75,8 @@ def ensure_model(path: str, backend: str) -> None:
 
 
 def infer_backend(model_path: str, backend: str) -> str:
+    # In auto mode, `.pt` means Ultralytics and anything else is treated as an
+    # ONNX graph for OpenCV DNN.
     if backend != "auto":
         return backend
     if model_path.endswith(".pt"):
@@ -83,6 +91,7 @@ def ensure_parent_dir(path: str) -> None:
 
 
 def csi_pipeline(width: int, height: int, fps: int, sensor_id: int) -> str:
+    # Jetson CSI capture path: Argus -> NVMM -> BGR frames for OpenCV.
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} ! "
         f"video/x-raw(memory:NVMM), width=(int){width}, height=(int){height}, "
@@ -93,6 +102,8 @@ def csi_pipeline(width: int, height: int, fps: int, sensor_id: int) -> str:
 
 
 def letterbox(frame: np.ndarray, size: int) -> Tuple[np.ndarray, float, float, float]:
+    # Resize with preserved aspect ratio and remember the scale/padding so the
+    # model-space outputs can be mapped back onto original frame coordinates.
     h, w = frame.shape[:2]
     scale = min(size / w, size / h)
     resized_w = int(round(w * scale))
@@ -113,6 +124,7 @@ def clamp(v: float, lo: float, hi: float) -> float:
 
 def point_from_triplet(values: np.ndarray, frame_w: int, frame_h: int, scale: float, pad_x: float,
                        pad_y: float) -> Dict[str, float]:
+    # Each keypoint arrives as `(x, y, confidence)` in model-input space.
     x = clamp((float(values[0]) - pad_x) / scale, 0.0, frame_w - 1.0)
     y = clamp((float(values[1]) - pad_y) / scale, 0.0, frame_h - 1.0)
     conf = float(values[2])
@@ -128,6 +140,8 @@ def midpoint(a: Dict[str, float], b: Dict[str, float]) -> Dict[str, float]:
 
 
 def angle_from_vertical_deg(top: Dict[str, float], bottom: Dict[str, float]) -> float:
+    # Positive values mean the torso leans to the camera's right, negative to
+    # the left, measured relative to a vertical line.
     dx = bottom["x"] - top["x"]
     dy = bottom["y"] - top["y"]
     return math.degrees(math.atan2(dx, max(dy, 1e-6)))
@@ -139,6 +153,8 @@ def distance(a: Dict[str, float], b: Dict[str, float]) -> float:
 
 def build_pose_metrics(keypoints: Dict[str, Dict[str, float]], bbox: List[float],
                        calibration_baseline_deg: Optional[float]) -> Dict[str, object]:
+    # Convert raw keypoints into posture-oriented features that are easier to
+    # inspect and later classify than the full landmark set alone.
     metrics: Dict[str, object] = {}
     left_shoulder = keypoints.get("left_shoulder")
     right_shoulder = keypoints.get("right_shoulder")
@@ -147,6 +163,7 @@ def build_pose_metrics(keypoints: Dict[str, Dict[str, float]], bbox: List[float]
     nose = keypoints.get("nose")
 
     if left_shoulder and right_shoulder:
+        # Chest center is approximated as the midpoint between both shoulders.
         chest_center = midpoint(left_shoulder, right_shoulder)
         metrics["chest_center"] = chest_center
         shoulder_tilt_deg = math.degrees(
@@ -157,18 +174,22 @@ def build_pose_metrics(keypoints: Dict[str, Dict[str, float]], bbox: List[float]
         chest_center = None
 
     if left_hip and right_hip:
+        # Hip center is the torso anchor used with chest center for lean angle.
         hip_center = midpoint(left_hip, right_hip)
         metrics["hip_center"] = hip_center
     else:
         hip_center = None
 
     if chest_center and hip_center:
+        # Torso angle and length are normalized against the detection box so the
+        # metric is less sensitive to how close the subject is to the camera.
         torso_angle_deg = angle_from_vertical_deg(chest_center, hip_center)
         bbox_h = max(bbox[3] - bbox[1], 1e-6)
         torso_length_norm = distance(chest_center, hip_center) / bbox_h
         metrics["torso_angle_deg"] = round(torso_angle_deg, 3)
         metrics["torso_length_norm"] = round(torso_length_norm, 6)
         spine_points = []
+        # This is only a visual proxy, not a full anatomical spine estimate.
         if nose and nose["conf"] >= 0.2:
             spine_points.append(nose)
         spine_points.append(chest_center)
@@ -183,6 +204,8 @@ def build_pose_metrics(keypoints: Dict[str, Dict[str, float]], bbox: List[float]
 def decode_pose_output(output: np.ndarray, frame_shape: Tuple[int, int], scale: float, pad_x: float,
                        pad_y: float, conf_thres: float, nms_thres: float,
                        keypoint_thres: float) -> List[Dict[str, object]]:
+    # OpenCV DNN returns a dense pose tensor. This function filters low-score
+    # rows, remaps bbox/keypoint coordinates, and applies NMS.
     if output.ndim == 3:
         output = np.squeeze(output, axis=0)
     if output.ndim != 2:
@@ -212,6 +235,8 @@ def decode_pose_output(output: np.ndarray, frame_shape: Tuple[int, int], scale: 
             continue
 
         triplets = row[5 : 5 + len(KEYPOINT_NAMES) * 3].reshape(len(KEYPOINT_NAMES), 3)
+        # Only keep confident keypoints so downstream metrics don't quietly use
+        # weak landmarks.
         keypoints = {
             name: point_from_triplet(triplets[idx], frame_w, frame_h, scale, pad_x, pad_y)
             for idx, name in enumerate(KEYPOINT_NAMES)
@@ -238,6 +263,8 @@ def decode_pose_output(output: np.ndarray, frame_shape: Tuple[int, int], scale: 
 
 
 def decode_ultralytics_result(result: Any, frame_shape: Tuple[int, int], keypoint_thres: float) -> List[Dict[str, object]]:
+    # Ultralytics already performs decode/NMS. Here we just normalize the
+    # result object into the same detection schema used by the OpenCV backend.
     boxes = getattr(result, "boxes", None)
     keypoints = getattr(result, "keypoints", None)
     if boxes is None or keypoints is None or boxes.xyxy is None or keypoints.data is None:
@@ -297,6 +324,8 @@ def draw_line(frame: np.ndarray, a: Dict[str, float], b: Dict[str, float],
 
 
 def annotate_pose(frame: np.ndarray, detection: Dict[str, object], baseline_deg: Optional[float]) -> None:
+    # Visualization layer for debugging and dataset review. It does not change
+    # the metrics that are written to JSONL.
     x1, y1, x2, y2 = [int(round(v)) for v in detection["bbox_xyxy"]]
     keypoints = detection["keypoints"]
     metrics = detection["metrics"]
@@ -390,6 +419,7 @@ def main() -> None:
     backend = infer_backend(args.model, args.backend)
     ensure_model(args.model, backend)
 
+    # Open the Jetson CSI camera through the Argus-backed GStreamer pipeline.
     cap = cv2.VideoCapture(
         csi_pipeline(args.width, args.height, args.fps, args.sensor_id),
         cv2.CAP_GSTREAMER,
@@ -398,6 +428,7 @@ def main() -> None:
         raise SystemExit("failed to open CSI camera through GStreamer")
 
     if backend == "opencv":
+        # OpenCV backend expects an exported pose ONNX graph and manual decode.
         net = cv2.dnn.readNetFromONNX(args.model)
         yolo_model = None
     else:
@@ -408,6 +439,7 @@ def main() -> None:
                 "ultralytics backend requested but package import failed.\n"
                 "Install it with: python3 -m pip install --user ultralytics"
             ) from exc
+        # Ultralytics backend handles preprocessing and decode internally.
         yolo_model = YOLO(args.model)
         net = None
     ensure_parent_dir(args.output)
@@ -432,6 +464,8 @@ def main() -> None:
                 break
 
             if backend == "opencv":
+                # Match the exported YOLO pose graph's expected square input,
+                # then translate outputs back to original frame coordinates.
                 model_input, scale, pad_x, pad_y = letterbox(frame, args.imgsz)
                 blob = cv2.dnn.blobFromImage(
                     model_input,
@@ -453,6 +487,8 @@ def main() -> None:
                     args.kpt_thres,
                 )
             else:
+                # Limit live inference to the top detection because this script
+                # is currently centered on single-subject posture capture.
                 results = yolo_model.predict(
                     source=frame,
                     imgsz=args.imgsz,
@@ -466,6 +502,7 @@ def main() -> None:
 
             primary_detection = detections[0] if detections else None
             if primary_detection:
+                # Build derived posture metrics on top of raw landmarks.
                 primary_detection["metrics"] = build_pose_metrics(
                     primary_detection["keypoints"],
                     primary_detection["bbox_xyxy"],
@@ -473,6 +510,8 @@ def main() -> None:
                 )
                 torso_angle = primary_detection["metrics"].get("torso_angle_deg")
                 if torso_angle is not None and baseline_deg is None and len(baseline_samples) < args.calibration_frames:
+                    # Use the first calibration window to establish the user's
+                    # neutral torso angle for the current camera placement.
                     baseline_samples.append(float(torso_angle))
                     if len(baseline_samples) == args.calibration_frames:
                         baseline_deg = float(sum(baseline_samples) / len(baseline_samples))
@@ -485,6 +524,8 @@ def main() -> None:
 
                 annotate_pose(frame, primary_detection, baseline_deg)
 
+            # The on-frame status text makes calibration progress visible in the
+            # saved review video even without opening the JSONL output.
             status = f"calib={len(baseline_samples)}/{args.calibration_frames}" if baseline_deg is None else f"baseline={baseline_deg:.1f}deg"
             cv2.putText(
                 frame,
@@ -504,6 +545,8 @@ def main() -> None:
                 "baseline_deg": round(baseline_deg, 6) if baseline_deg is not None else None,
                 "primary_detection": primary_detection,
             }
+            # Write one JSON object per frame so later analysis can stream or
+            # grep the capture without loading the whole run into memory.
             pose_file.write(json.dumps(report) + "\n")
             last_report = report
 
