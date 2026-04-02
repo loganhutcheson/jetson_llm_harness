@@ -1,2 +1,5 @@
 build/
 experiments/observer/app
+__pycache__/
+*.pyc
+results_mac.csv

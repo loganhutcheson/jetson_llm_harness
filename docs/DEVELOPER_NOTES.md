@@ -124,6 +124,100 @@ gst-launch-1.0 -e nvarguscamerasrc sensor-id=0 num-buffers=1 ! 'video/x-raw(memo
 file /tmp/imx219_cam1_test.jpg
 ```
 
+## Dual IMX219 Bring-up
+
+Current dual-camera setup on this Jetson:
+- CSI_0 / CAM0: IMX219 IR camera with IR LED array
+- CSI_1 / CAM1: regular IMX219 camera
+- the runtime kernel DTB must be dual-capable before the second camera will ever probe
+- on this Jetson, selecting the dual overlay in `extlinux.conf` was not enough by itself
+- the final working fix was generating a merged dual DTB and writing it into both `A_kernel-dtb` and `B_kernel-dtb`
+
+Why this mattered:
+- with the old CAM1-only runtime DTB, the live `rbpcv2_imx219_a@10` node stayed `disabled`
+- after the dual merged DTB was written into the runtime partitions, the kernel began probing both sensors
+- healthy dual probe looks like:
+  - `imx219 9-0010 ... bound`
+  - `imx219 10-0010 ... bound`
+
+Useful paths and mappings:
+- stock base DTB:
+  - `/boot/tegra234-p3768-0000+p3767-0005-nv-super.dtb`
+- official dual overlay:
+  - `/boot/tegra234-p3767-camera-p3768-imx219-dual.dtbo`
+- generated dual merged DTB:
+  - `/boot/dtb/kernel_tegra234-p3768-0000+p3767-0005-nv-super.imx219-dual.merged.dtb`
+- live DT camera nodes:
+  - CSI_0: `/sys/firmware/devicetree/base/bus@0/cam_i2cmux/i2c@0/rbpcv2_imx219_a@10`
+  - CSI_1: `/sys/firmware/devicetree/base/bus@0/cam_i2cmux/i2c@1/rbpcv2_imx219_c@10`
+- live camera-platform mapping:
+  - `module0 -> rbpcv2_imx219_a@10 -> CSI_0`
+  - `module1 -> rbpcv2_imx219_c@10 -> CSI_1`
+
+Validated dual-DTB workflow on the Jetson:
+
+```bash
+sudo ./jetson/camera/force_imx219_cam1_dtb.sh --dual --reboot
+```
+
+Post-reboot validation:
+
+```bash
+ls -l /dev/video* /dev/media* 2>/dev/null
+sudo dmesg | egrep -i 'imx219|camera|nvcsi|vi5|csi'
+gst-launch-1.0 -e nvarguscamerasrc sensor-id=0 num-buffers=1 ! 'video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1' ! nvjpegenc ! filesink location=/tmp/csi0_test.jpg
+gst-launch-1.0 -e nvarguscamerasrc sensor-id=1 num-buffers=1 ! 'video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1' ! nvjpegenc ! filesink location=/tmp/csi1_test.jpg
+file /tmp/csi0_test.jpg /tmp/csi1_test.jpg
+```
+
+Healthy dual-camera indicators:
+- `/dev/video0` and `/dev/video1` both exist on this Jetson
+- both IMX219 sensors bind in `dmesg`
+- `sensor-id=0` still capture succeeds
+- `sensor-id=1` still capture succeeds
+
+Important Argus note:
+- with the old single-CAM1 runtime DTB, `sensor-id=0` referred to the only active camera on CSI_1
+- with the working dual merged DTB, Argus ordering follows the live camera-platform modules:
+  - `sensor-id=0` -> CSI_0 / IMX219 A / current IR camera
+  - `sensor-id=1` -> CSI_1 / IMX219 C / current regular camera
+
+IR-camera-specific notes:
+- the IR IMX219 is not a thermal camera
+- it is a normal image sensor that can see near-IR illumination from the LED array
+- in darkness it acts like a camera plus a less-visible IR flashlight
+- if the image is only haze or noise, check lens focus before assuming the sensor path is broken
+- these modules are manual-focus; some lenses are thread-locked from the factory
+
+Validated CSI_0 IR still capture:
+
+```bash
+gst-launch-1.0 -e nvarguscamerasrc sensor-id=0 num-buffers=1 ! 'video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1' ! nvjpegenc ! filesink location=/tmp/ir_cam_still.jpg
+file /tmp/ir_cam_still.jpg
+```
+
+Validated CSI_0 IR live stream to Mac:
+
+Mac receiver:
+
+```bash
+ffplay -fflags nobuffer -flags low_delay -framedrop 'udp://0.0.0.0:5008?listen=1&fifo_size=1000000&overrun_nonfatal=1'
+```
+
+Jetson sender:
+
+```bash
+printf 'Lablab123\n' | sudo -S systemctl restart nvargus-daemon
+gst-launch-1.0 -e nvarguscamerasrc sensor-id=0 ! 'video/x-raw(memory:NVMM),width=1920,height=1080,framerate=30/1,format=NV12' ! nvvidconv ! 'video/x-raw,format=I420,width=640,height=360' ! videorate ! 'video/x-raw,framerate=10/1' ! x264enc tune=zerolatency speed-preset=ultrafast bitrate=1000 key-int-max=10 byte-stream=true ! h264parse config-interval=1 ! mpegtsmux ! udpsink host=192.168.8.192 port=5008 sync=false async=false
+```
+
+Focus helpers for the manual-focus IR module:
+
+```bash
+gst-launch-1.0 nvarguscamerasrc sensor-id=0 ! 'video/x-raw(memory:NVMM),width=1280,height=720,framerate=30/1' ! nvvidconv ! xvimagesink
+watch -n 0.5 "gst-launch-1.0 -q nvarguscamerasrc sensor-id=0 num-buffers=1 ! 'video/x-raw(memory:NVMM),width=1280,height=720,framerate=30/1' ! nvjpegenc ! filesink location=/tmp/ir_focus.jpg && file /tmp/ir_focus.jpg"
+```
+
 ## Pose Capture
 
 The active vision path in this repo is `jetson/inference/pose_camera_demo.py`.
