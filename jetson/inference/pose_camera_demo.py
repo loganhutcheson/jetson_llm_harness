@@ -18,6 +18,7 @@ from posture_classifier import (
     load_posture_model,
     predict_posture,
 )
+from posture_history import PostureHistoryStore
 
 # Default pose model path for the OpenCV DNN backend. Passing a `.pt` model
 # switches the script to the Ultralytics runtime instead.
@@ -481,6 +482,9 @@ def main() -> None:
     parser.add_argument("--oled-i2c-dev", default=os.environ.get("JETSON_OLED_I2C_DEV", "/dev/i2c-7"))
     parser.add_argument("--oled-i2c-addr", type=lambda value: int(value, 0),
                         default=int(os.environ.get("JETSON_OLED_I2C_ADDR", "0x3c"), 0))
+    parser.add_argument("--sqlite-db", default="")
+    parser.add_argument("--sqlite-sample-interval", type=float, default=5.0)
+    parser.add_argument("--session-name", default="")
     parser.add_argument("--show", action="store_true")
     args = parser.parse_args()
 
@@ -538,6 +542,7 @@ def main() -> None:
     )
     posture_result: Optional[Dict[str, object]] = None
     oled_display: Optional[OledStatusDisplay] = None
+    history_store: Optional[PostureHistoryStore] = None
     if args.oled_status:
         try:
             oled_display = OledStatusDisplay(
@@ -550,6 +555,15 @@ def main() -> None:
         except Exception as exc:
             oled_display = None
             print(f"[OLED] init failed: {exc}")
+    if args.sqlite_db:
+        ensure_parent_dir(args.sqlite_db)
+        history_store = PostureHistoryStore(
+            db_path=args.sqlite_db,
+            sample_interval_s=args.sqlite_sample_interval,
+            session_name=args.session_name,
+        )
+        session_id = history_store.start_session(vars(args))
+        print(f"[sqlite] enabled db={args.sqlite_db} session_id={session_id}")
 
     try:
         pose_file = open(args.pose_out, "w", encoding="utf-8") if args.pose_out else None
@@ -697,6 +711,8 @@ def main() -> None:
                 # grep the capture without loading the whole run into memory.
                 if args.pose_out:
                     active_pose_file.write(json.dumps(report) + "\n")
+                if history_store is not None:
+                    history_store.record_report(report)
                 last_report = report
 
                 if frame_idx % args.print_every == 0:
@@ -712,6 +728,12 @@ def main() -> None:
     finally:
         if oled_display:
             oled_display.close()
+        if history_store is not None:
+            history_store.finish_session(
+                total_frames=max(last_report.get("frame", -1) + 1, 0),
+                last_status_label=str(last_report.get("oled_status_text", "not found")).replace(" ", "_"),
+            )
+            history_store.close()
 
     elapsed = time.time() - start
     cap.release()

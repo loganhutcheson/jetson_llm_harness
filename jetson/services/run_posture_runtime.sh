@@ -25,6 +25,9 @@ posture_smoothing="${POSTURE_RUNTIME_POSTURE_SMOOTHING:-0.25}"
 oled_status="${POSTURE_RUNTIME_OLED_STATUS:-0}"
 oled_i2c_dev="${POSTURE_RUNTIME_OLED_I2C_DEV:-/dev/i2c-7}"
 oled_i2c_addr="${POSTURE_RUNTIME_OLED_I2C_ADDR:-0x3c}"
+sqlite_db="${POSTURE_RUNTIME_SQLITE_DB:-}"
+sqlite_sample_interval="${POSTURE_RUNTIME_SQLITE_SAMPLE_INTERVAL:-5}"
+session_name="${POSTURE_RUNTIME_SESSION_NAME:-}"
 output_path="${POSTURE_RUNTIME_OUTPUT:-}"
 pose_out_path="${POSTURE_RUNTIME_POSE_OUT:-}"
 
@@ -50,6 +53,14 @@ args=(
 
 if [[ -n "${posture_model}" ]]; then
   args+=(--posture-model "${posture_model}")
+fi
+
+if [[ -n "${sqlite_db}" ]]; then
+  args+=(--sqlite-db "${sqlite_db}" --sqlite-sample-interval "${sqlite_sample_interval}")
+fi
+
+if [[ -n "${session_name}" ]]; then
+  args+=(--session-name "${session_name}")
 fi
 
 if [[ "${oled_status}" == "1" || "${oled_status}" == "true" || "${oled_status}" == "TRUE" ]]; then
