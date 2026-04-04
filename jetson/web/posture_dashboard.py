@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 import argparse
+import datetime as dt
 import json
 import sqlite3
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, List
+from typing import Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
+
+ACTIVE_SAMPLE_WINDOW_S = 600.0
 
 
 HTML = """<!doctype html>
@@ -97,6 +100,21 @@ HTML = """<!doctype html>
         </div>
       </div>
     </div>
+    <div class="charts" style="margin-top:16px;">
+      <div class="panel">
+        <div class="label">Daily Summary</div>
+        <table>
+          <thead><tr><th>Day</th><th>Good %</th><th>Avg Score</th><th>Longest Good Streak</th></tr></thead>
+          <tbody id="days"></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <div class="label">Streaks</div>
+        <table>
+          <tbody id="streaks"></tbody>
+        </table>
+      </div>
+    </div>
     <div class="panel" style="margin-top:16px;">
       <div class="label">Recent Status Changes</div>
       <table>
@@ -110,6 +128,8 @@ HTML = """<!doctype html>
     const mixSvg = document.getElementById("mixChart");
     const cards = document.getElementById("cards");
     const eventsBody = document.getElementById("events");
+    const daysBody = document.getElementById("days");
+    const streaksBody = document.getElementById("streaks");
     const hoursEl = document.getElementById("hours");
     const bucketEl = document.getElementById("bucket");
 
@@ -187,21 +207,51 @@ HTML = """<!doctype html>
       `).join("");
     }
 
+    function formatMinutes(value) {
+      if (value === null || value === undefined) {
+        return "n/a";
+      }
+      if (value < 60) {
+        return `${value.toFixed(0)} min`;
+      }
+      return `${(value / 60).toFixed(1)} hr`;
+    }
+
+    function renderAnalytics(analytics) {
+      daysBody.innerHTML = analytics.daily_rows.map(row => `
+        <tr>
+          <td>${row.day}</td>
+          <td>${(row.good_ratio * 100).toFixed(0)}%</td>
+          <td>${row.avg_score === null ? "n/a" : row.avg_score.toFixed(2)}</td>
+          <td>${formatMinutes(row.longest_good_streak_min)}</td>
+        </tr>
+      `).join("");
+      streaksBody.innerHTML = [
+        ["Current good streak", formatMinutes(analytics.current_good_streak_min)],
+        ["Longest good streak", formatMinutes(analytics.longest_good_streak_min)],
+        ["Current non-bad streak", formatMinutes(analytics.current_non_bad_streak_min)],
+        ["Longest non-bad streak", formatMinutes(analytics.longest_non_bad_streak_min)],
+      ].map(([label, value]) => `<tr><th>${label}</th><td>${value}</td></tr>`).join("");
+    }
+
     async function refresh() {
       const hours = hoursEl.value;
       const bucket = bucketEl.value;
-      const [summaryResp, seriesResp, eventsResp] = await Promise.all([
+      const [summaryResp, seriesResp, eventsResp, analyticsResp] = await Promise.all([
         fetch(`/api/summary?hours=${hours}`),
         fetch(`/api/series?hours=${hours}&bucket_minutes=${bucket}`),
         fetch(`/api/events?hours=${hours}`),
+        fetch(`/api/analytics?hours=${hours}`),
       ]);
       const summary = await summaryResp.json();
       const series = await seriesResp.json();
       const events = await eventsResp.json();
+      const analytics = await analyticsResp.json();
       renderCards(summary);
       renderScoreChart(series.rows);
       renderMixChart(series.rows);
       renderEvents(events.rows);
+      renderAnalytics(analytics);
     }
 
     hoursEl.addEventListener("change", refresh);
@@ -315,6 +365,113 @@ def query_events(conn: sqlite3.Connection, hours: int) -> Dict[str, List[Dict[st
     }
 
 
+def _fetch_samples(conn: sqlite3.Connection, since: float) -> List[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT ts_unix, status_label, posture_value
+        FROM posture_samples
+        WHERE ts_unix >= ?
+        ORDER BY ts_unix
+        """,
+        (since,),
+    ).fetchall()
+
+
+def _segment_minutes(start_ts: float, end_ts: float) -> float:
+    return max(end_ts - start_ts, 0.0) / 60.0
+
+
+def _status_matches(status_label: str, allowed: set[str]) -> bool:
+    return status_label in allowed
+
+
+def _compute_streaks(samples: List[sqlite3.Row], now_ts: float, allowed: set[str]) -> Dict[str, Optional[float]]:
+    longest = 0.0
+    current = 0.0
+    streak_start_ts: Optional[float] = None
+    previous_ts: Optional[float] = None
+
+    for row in samples:
+        ts_unix = float(row["ts_unix"])
+        status_label = str(row["status_label"])
+        if _status_matches(status_label, allowed):
+            if streak_start_ts is None:
+                streak_start_ts = ts_unix
+            previous_ts = ts_unix
+        else:
+            if streak_start_ts is not None and previous_ts is not None:
+                longest = max(longest, _segment_minutes(streak_start_ts, previous_ts))
+            streak_start_ts = None
+            previous_ts = None
+
+    if streak_start_ts is not None and previous_ts is not None:
+        effective_end_ts = now_ts if (now_ts - previous_ts) <= ACTIVE_SAMPLE_WINDOW_S else previous_ts
+        current = _segment_minutes(streak_start_ts, effective_end_ts)
+        longest = max(longest, current)
+
+    return {
+        "current_min": current if samples else None,
+        "longest_min": longest if samples else None,
+    }
+
+
+def query_analytics(conn: sqlite3.Connection, hours: int) -> Dict[str, object]:
+    now_ts = time.time()
+    since = now_ts - hours * 3600
+    samples = _fetch_samples(conn, since)
+
+    day_buckets: Dict[str, Dict[str, object]] = {}
+    for row in samples:
+        ts_unix = float(row["ts_unix"])
+        day = dt.datetime.fromtimestamp(ts_unix).strftime("%Y-%m-%d")
+        bucket = day_buckets.setdefault(
+            day,
+            {
+                "day": day,
+                "count": 0,
+                "good_count": 0,
+                "score_sum": 0.0,
+                "score_count": 0,
+            },
+        )
+        bucket["count"] = int(bucket["count"]) + 1
+        if row["status_label"] == "good":
+            bucket["good_count"] = int(bucket["good_count"]) + 1
+        if row["posture_value"] is not None:
+            bucket["score_sum"] = float(bucket["score_sum"]) + float(row["posture_value"])
+            bucket["score_count"] = int(bucket["score_count"]) + 1
+
+    daily_rows = []
+    for day, bucket in sorted(day_buckets.items(), reverse=True)[:14]:
+        day_start = dt.datetime.strptime(day, "%Y-%m-%d").timestamp()
+        day_end = day_start + 86400
+        day_samples = [row for row in samples if day_start <= float(row["ts_unix"]) < day_end]
+        streak = _compute_streaks(day_samples, min(day_end, now_ts), {"good"})
+        good_ratio = (bucket["good_count"] / bucket["count"]) if bucket["count"] else 0.0
+        avg_score = (
+            float(bucket["score_sum"]) / int(bucket["score_count"])
+            if bucket["score_count"] else None
+        )
+        daily_rows.append(
+            {
+                "day": day,
+                "good_ratio": good_ratio,
+                "avg_score": avg_score,
+                "longest_good_streak_min": streak["longest_min"],
+            }
+        )
+
+    good_streak = _compute_streaks(samples, now_ts, {"good"})
+    non_bad_streak = _compute_streaks(samples, now_ts, {"good", "okay"})
+    return {
+        "current_good_streak_min": good_streak["current_min"],
+        "longest_good_streak_min": good_streak["longest_min"],
+        "current_non_bad_streak_min": non_bad_streak["current_min"],
+        "longest_non_bad_streak_min": non_bad_streak["longest_min"],
+        "daily_rows": daily_rows,
+    }
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     db_path = ""
 
@@ -354,6 +511,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/events":
                 self._send_json(query_events(conn, hours))
+                return
+            if parsed.path == "/api/analytics":
+                self._send_json(query_analytics(conn, hours))
                 return
             self.send_error(HTTPStatus.NOT_FOUND, "not found")
         finally:
